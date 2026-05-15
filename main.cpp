@@ -3,7 +3,7 @@
 // ============================================================
 // Hardware:
 //   - Enclosure: Wooden box 30x30x30 cm
-//   - Sensor: LM35 analog temperature sensor (10mV/°C)
+//   - Sensor: DHT11 digital temperature & humidity sensor
 //   - Actuator: Incandescent lamp (< 200W) on mains (127V/220V)
 //   - Switching: Relay module (mechanical, slow PWM to preserve life)
 //   - Controller: ESP32 (programmed via PlatformIO)
@@ -16,23 +16,25 @@
 // Output:
 //   - JSON telemetry at 1 Hz over Serial (115200 baud) for debugging
 //   - HTTP API on port 80 over WiFi for dashboard consumption
-//     GET  /data             → latest telemetry JSON
+//     GET  /data             → latest telemetry JSON (includes humidity)
 //     GET  /status           → system health + WiFi info
 //     POST /control/power    → {"enabled": true/false} — turn system on/off
 //     POST /control/setpoint → {"setpoint": 38.5}     — change target temp (30–42°C)
 //
-// Notes (ESP32 ADC):
-//   - 12-bit ADC (0–4095) with 0dB attenuation → 0–1.1V input range
-//   - At 38°C the LM35 outputs 380mV → well within range
-//   - Resolution: ~0.027°C per ADC step (excellent for incubation)
-//   - ESP32 ADC is noisier than AVR — EMA filter compensates
-//   - LM35 must be powered from 5V (VIN), signal wire to ADC pin
+// Notes (DHT11):
+//   - Digital single-wire protocol (no ADC needed)
+//   - Temperature range: 0–50°C, resolution: 1°C, accuracy: ±2°C
+//   - Humidity range: 20–90% RH, resolution: 1%, accuracy: ±5%
+//   - Minimum sampling interval: ~1s (we read at 1 Hz — perfect)
+//   - EMA filter smooths the 1°C steps for more stable PID control
+//   - Powered from 3.3V or 5V; data pin needs 10kΩ pull-up to VCC
 // ============================================================
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp_task_wdt.h> // ESP32 task watchdog timer
+#include <DHT.h>          // Adafruit DHT sensor library
 
 // ============ WIFI CONFIGURATION ============
 // TODO: Replace with your network credentials
@@ -43,8 +45,11 @@ WebServer server(80); // HTTP server on port 80
 
 // ============ PIN DEFINITIONS ============
 
-#define PIN_SENSOR_TEMP 36  // GPIO36 (VP) — ADC1_CH0, input-only pin, ideal for analog sensor
-#define PIN_RELAY       23  // GPIO23 — digital output for the relay module
+#define PIN_DHT    4       // GPIO4 — data pin for DHT11 sensor (with 10kΩ pull-up to VCC)
+#define DHTTYPE    DHT11   // DHT11 sensor type (change to DHT22 for higher precision)
+#define PIN_RELAY  23      // GPIO23 — digital output for the relay module
+
+DHT dht(PIN_DHT, DHTTYPE);
 
 // Set to true if your relay module is active-LOW (most common relay boards)
 #define RELAY_ACTIVE_LOW false
@@ -63,8 +68,8 @@ const float SETPOINT_MAX = 42.0;
 
 // Safety thresholds
 const float TEMP_MAX_CUTOFF = 42.0;  // Hard over-temperature cutoff — lamp OFF immediately (°C)
-const float TEMP_MIN_VALID  = 5.0;   // Minimum plausible LM35 reading (°C)
-const float TEMP_MAX_VALID  = 105.0; // Maximum plausible with 0dB attenuation (~110°C max)
+const float TEMP_MIN_VALID  = 0.0;   // Minimum plausible DHT11 reading (°C)
+const float TEMP_MAX_VALID  = 50.0;  // Maximum DHT11 reading (°C) — sensor spec limit
 
 // ============ PID PARAMETERS ============
 
@@ -83,9 +88,11 @@ unsigned long previousMillisPWM      = 0;  // Last PWM period start timestamp
 unsigned long timeOn                 = 0;  // Calculated relay ON time for current period
 unsigned long activeTimeOn           = 0;  // Latched relay ON time (updated only at PWM period boundary)
 
-// EMA temperature filter
-float filteredTemp = 0.0;
-bool  firstReading = true;
+// EMA temperature & humidity filters
+float filteredTemp     = 0.0;
+float filteredHumidity = 0.0;
+float latestHumidity   = 0.0;  // Latest humidity for telemetry
+bool  firstReading     = true;
 
 // Safety state
 bool sensorFault    = false;
@@ -132,12 +139,13 @@ void setupWiFi() {
 }
 
 /// Builds the telemetry JSON string from current values
-String buildJson(float temp, float e, float pidOutput,
+String buildJson(float temp, float humidity, float e, float pidOutput,
                  float pTerm, float iTerm, float dTerm,
                  bool relayOn, unsigned long uptime) {
   String json = "{";
   json += "\"system_enabled\":" + String(systemEnabled ? "true" : "false");
   json += ",\"temperatura\":"  + String(temp, 2);
+  json += ",\"umidade\":"      + String(humidity, 1);
   json += ",\"setpoint\":"    + String(setpoint, 1);
   json += ",\"potencia_pwm\":" + String(pidOutput, 2);
   json += ",\"erro\":"        + String(e, 2);
@@ -261,36 +269,37 @@ void handleNotFound() {
   server.send(404, "application/json", "{\"error\":\"NOT_FOUND\"}");
 }
 
-/// Reads and filters the temperature using an Exponential Moving Average (EMA).
-/// ESP32 12-bit ADC with 0dB attenuation → 0–1.1V range → ~0.027°C resolution.
-/// LM35 outputs 10mV/°C → max readable temp ≈ 110°C (plenty for incubation).
-/// Returns -999.0 as a sentinel value if the sensor reading is out of valid range.
+/// Reads temperature and humidity from the DHT11 sensor, filtered with EMA.
+/// DHT11 has 1°C resolution — the EMA filter smooths the steps for stable PID.
+/// Also updates latestHumidity for telemetry.
+/// Returns -999.0 as a sentinel value if the sensor reading fails.
 float readTemperature() {
-  // Take 10 samples with short delays for ADC stabilization
-  // ESP32 ADC is noisier than AVR, so multi-sampling is important
-  long sum = 0;
-  for (int i = 0; i < 10; i++) {
-    sum += analogRead(PIN_SENSOR_TEMP);
-    delay(2);
-  }
-  float average = sum / 10.0;
-  // LM35 formula with ESP32 12-bit ADC at 0dB attenuation (0–1.1V range):
-  // temp = (ADC_value / 4095) * 1.1V * 100 (since LM35 = 10mV/°C)
-  float rawTemp = (average * 1.1 * 100.0) / 4095.0;
+  float rawTemp     = dht.readTemperature(); // Celsius
+  float rawHumidity = dht.readHumidity();
 
-  // Sensor disconnect / fault detection
-  if (rawTemp < TEMP_MIN_VALID || rawTemp > TEMP_MAX_VALID) {
+  // DHT library returns NaN on read failure (checksum error, timeout, etc.)
+  if (isnan(rawTemp) || isnan(rawHumidity)) {
     return -999.0; // Sentinel: sensor fault
   }
 
-  // Apply EMA filter for noise smoothing
-  if (firstReading) {
-    filteredTemp = rawTemp;
-    firstReading = false;
-  } else {
-    filteredTemp = 0.80 * filteredTemp + 0.20 * rawTemp; // alpha = 0.20 (slightly higher to compensate for ESP32 ADC noise)
+  // Sensor range validation
+  if (rawTemp < TEMP_MIN_VALID || rawTemp > TEMP_MAX_VALID) {
+    return -999.0; // Sentinel: out of valid range
   }
 
+  // Apply EMA filter for noise smoothing
+  // DHT11's 1°C resolution makes filtering especially important
+  // to avoid PID jitter at step boundaries
+  if (firstReading) {
+    filteredTemp     = rawTemp;
+    filteredHumidity = rawHumidity;
+    firstReading     = false;
+  } else {
+    filteredTemp     = 0.70 * filteredTemp     + 0.30 * rawTemp;     // alpha = 0.30 (more responsive since DHT11 is less noisy than ADC)
+    filteredHumidity = 0.70 * filteredHumidity + 0.30 * rawHumidity;
+  }
+
+  latestHumidity = filteredHumidity;
   return filteredTemp;
 }
 
@@ -299,13 +308,9 @@ float readTemperature() {
 void setup() {
   Serial.begin(115200);
 
-  // Configure ESP32 ADC for LM35:
-  // - 12-bit resolution (0–4095)
-  // - 0dB attenuation → 0–1.1V input range (best resolution for LM35)
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_0db);
-  // Discard first few readings (ADC needs to settle after config)
-  for (int i = 0; i < 10; i++) analogRead(PIN_SENSOR_TEMP);
+  // Initialize DHT11 sensor
+  dht.begin();
+  delay(1000); // DHT11 needs ~1s to stabilize after power-on
 
   pinMode(PIN_RELAY, OUTPUT);
   setRelay(false); // Ensure the lamp is OFF at startup
@@ -377,7 +382,7 @@ void loop() {
     // If system is disabled, still read temp (for monitoring) but skip PID
     if (!systemEnabled) {
       bool relayOn = false;
-      latestJson = buildJson(temperature, 0, 0, 0, 0, 0, relayOn, currentMillis);
+      latestJson = buildJson(temperature, latestHumidity, 0, 0, 0, 0, 0, relayOn, currentMillis);
       Serial.println(latestJson);
       return;
     }
@@ -432,7 +437,7 @@ void loop() {
 
     // --- BUILD JSON + OUTPUT ---
     bool relayOn = (currentMillis - previousMillisPWM) < activeTimeOn;
-    latestJson = buildJson(temperature, e, pidOutput, pTerm, iTerm, dTerm, relayOn, currentMillis);
+    latestJson = buildJson(temperature, latestHumidity, e, pidOutput, pTerm, iTerm, dTerm, relayOn, currentMillis);
 
     // Also output to Serial for debugging
     Serial.println(latestJson);
